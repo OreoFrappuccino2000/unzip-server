@@ -1,5 +1,5 @@
 import hashlib
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 import subprocess
 import os
@@ -17,15 +17,15 @@ os.makedirs(CACHE_ROOT, exist_ok=True)
 app.mount("/files", StaticFiles(directory=FILES_ROOT), name="files")
 
 MAX_FRAMES = 20
-BASE_URL = "https://videoserver-production.up.railway.app"
+BASE_URL = "https://video-server-return-frames-production.up.railway.app"
 
 
 @app.post("/run")
-def run(video_url: str):
+def run(video_url: str = Query(...)):
     video_url = video_url.strip()
 
     # --------------------------------------------------
-    # ✅ 0️⃣ HASH KEY FOR STABLE CACHE
+    # ✅ 0️⃣ CACHE KEY
     # --------------------------------------------------
     video_hash = hashlib.md5(video_url.encode()).hexdigest()
     cached_video_path = os.path.join(CACHE_ROOT, f"{video_hash}.mp4")
@@ -35,11 +35,16 @@ def run(video_url: str):
     os.makedirs(job_dir, exist_ok=True)
 
     # --------------------------------------------------
-    # ✅ 1️⃣ VIDEO DOWNLOAD (CACHED)
+    # ✅ 1️⃣ DOWNLOAD VIDEO (WITH REDIRECTS)
     # --------------------------------------------------
     if not os.path.exists(cached_video_path):
         try:
-            with requests.get(video_url, stream=True, timeout=120) as r:
+            with requests.get(
+                video_url,
+                stream=True,
+                allow_redirects=True,
+                timeout=180
+            ) as r:
                 r.raise_for_status()
                 with open(cached_video_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=1024 * 1024):
@@ -49,6 +54,10 @@ def run(video_url: str):
             raise HTTPException(400, f"Failed to download video: {e}")
 
     video_path = cached_video_path
+
+    # ✅ BLOCK INVALID DOWNLOADS
+    if os.path.getsize(video_path) < 1024 * 50:
+        raise HTTPException(400, "Downloaded file too small — not a valid video")
 
     # --------------------------------------------------
     # ✅ 2️⃣ PROBE DURATION
@@ -104,12 +113,12 @@ def run(video_url: str):
     frame_urls = frame_urls[:MAX_FRAMES]
 
     # --------------------------------------------------
-    # ✅ 4️⃣ FINAL RESPONSE (NO ZIP)
+    # ✅ 4️⃣ FINAL RESPONSE
     # --------------------------------------------------
     return {
         "job_id": job_id,
         "duration": duration,
         "total_frames": len(frame_urls),
         "frame_urls": frame_urls,
-        "cached": os.path.exists(cached_video_path)
+        "cached": os.path.exists(video_path)
     }
