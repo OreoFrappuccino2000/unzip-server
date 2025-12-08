@@ -22,10 +22,17 @@ BASE_URL = "https://video-server-return-frames-production.up.railway.app"
 
 @app.post("/run")
 def run(video_url: str = Query(...)):
-    video_url = video_url.strip()
+
+    # ✅ STRONG SANITISE (fixes '\n' crash permanently)
+    video_url = (
+        video_url
+        .replace("\n", "")
+        .replace("\r", "")
+        .strip()
+    )
 
     # --------------------------------------------------
-    # ✅ 0️⃣ CACHE KEY
+    # ✅ 0️⃣ STABLE CACHE KEY
     # --------------------------------------------------
     video_hash = hashlib.md5(video_url.encode()).hexdigest()
     cached_video_path = os.path.join(CACHE_ROOT, f"{video_hash}.mp4")
@@ -55,22 +62,27 @@ def run(video_url: str = Query(...)):
 
     video_path = cached_video_path
 
-    # ✅ BLOCK INVALID DOWNLOADS
-    if os.path.getsize(video_path) < 1024 * 50:
-        raise HTTPException(400, "Downloaded file too small — not a valid video")
+    # ✅ HARD BLOCK: invalid downloads (HTML, empty, error pages)
+    if not os.path.exists(video_path) or os.path.getsize(video_path) < 1024 * 50:
+        raise HTTPException(
+            400,
+            "Downloaded file is not a valid video (too small or missing)"
+        )
 
     # --------------------------------------------------
     # ✅ 2️⃣ PROBE DURATION
     # --------------------------------------------------
     try:
-        duration = float(subprocess.check_output([
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=nk=1:nw=1",
-            video_path
-        ]).decode().strip())
-    except:
-        raise HTTPException(400, "Failed to probe video")
+        duration = float(
+            subprocess.check_output([
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=nk=1:nw=1",
+                video_path
+            ]).decode().strip()
+        )
+    except Exception:
+        raise HTTPException(400, "Failed to probe video using ffprobe")
 
     # --------------------------------------------------
     # ✅ 3️⃣ PHASE SAMPLING
@@ -89,7 +101,7 @@ def run(video_url: str = Query(...)):
         phase_dir = os.path.join(job_dir, phase)
         os.makedirs(phase_dir, exist_ok=True)
 
-        # ✅ Only extract if missing
+        # ✅ Only extract if frames do not yet exist
         if not os.listdir(phase_dir):
             start_t = duration * start_r
             end_t = duration * end_r
@@ -107,8 +119,9 @@ def run(video_url: str = Query(...)):
             subprocess.run(ffmpeg_cmd, check=True)
 
         for f in sorted(os.listdir(phase_dir)):
-            url = f"{BASE_URL}/files/{job_id}/{phase}/{f}"
-            frame_urls.append(url)
+            frame_urls.append(
+                f"{BASE_URL}/files/{job_id}/{phase}/{f}"
+            )
 
     frame_urls = frame_urls[:MAX_FRAMES]
 
