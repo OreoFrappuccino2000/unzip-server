@@ -1,61 +1,115 @@
+import hashlib
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
-import requests, os, uuid, shutil
+import subprocess
+import os
+import math
+import requests
 
 app = FastAPI()
 
 FILES_ROOT = "/app/files"
+CACHE_ROOT = "/tmp/cache"
+
 os.makedirs(FILES_ROOT, exist_ok=True)
+os.makedirs(CACHE_ROOT, exist_ok=True)
 
 app.mount("/files", StaticFiles(directory=FILES_ROOT), name="files")
 
+MAX_FRAMES = 20
+BASE_URL = "https://videoserver-production.up.railway.app"
 
-@app.post("/register_frames")
-def register_frames(payload: dict):
-    """
-    Input:  { "frame_urls": [ "https://video-server/.../scene_001.jpg", ... ] }
-    Output: { "job_id": "...", "public_urls": [ "https://unzip-server/...jpg", ... ] }
-    """
 
-    frame_urls = payload.get("frame_urls", [])
-    if not frame_urls:
-        raise HTTPException(400, "frame_urls required")
+@app.post("/run")
+def run(video_url: str):
+    video_url = video_url.strip()
 
-    job_id = str(uuid.uuid4())
+    # --------------------------------------------------
+    # ✅ 0️⃣ HASH KEY FOR STABLE CACHE
+    # --------------------------------------------------
+    video_hash = hashlib.md5(video_url.encode()).hexdigest()
+    cached_video_path = os.path.join(CACHE_ROOT, f"{video_hash}.mp4")
+
+    job_id = video_hash
     job_dir = os.path.join(FILES_ROOT, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
-    public_urls = []
-
-    for i, url in enumerate(frame_urls):
-        filename = f"frame_{i:03d}.jpg"
-        local_path = os.path.join(job_dir, filename)
-
+    # --------------------------------------------------
+    # ✅ 1️⃣ VIDEO DOWNLOAD (CACHED)
+    # --------------------------------------------------
+    if not os.path.exists(cached_video_path):
         try:
-            with requests.get(url, stream=True, timeout=60) as r:
+            with requests.get(video_url, stream=True, timeout=120) as r:
                 r.raise_for_status()
-                with open(local_path, "wb") as f:
-                    for chunk in r.iter_content(1024 * 512):
+                with open(cached_video_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
                         if chunk:
                             f.write(chunk)
         except Exception as e:
-            raise HTTPException(400, f"Failed to fetch frame: {url} | {e}")
+            raise HTTPException(400, f"Failed to download video: {e}")
 
-        public_urls.append(
-            f"https://unzip-server-production-e061.up.railway.app/files/{job_id}/{filename}"
-        )
+    video_path = cached_video_path
 
-    return {
-        "job_id": job_id,
-        "total": len(public_urls),
-        "public_urls": public_urls
+    # --------------------------------------------------
+    # ✅ 2️⃣ PROBE DURATION
+    # --------------------------------------------------
+    try:
+        duration = float(subprocess.check_output([
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=nk=1:nw=1",
+            video_path
+        ]).decode().strip())
+    except:
+        raise HTTPException(400, "Failed to probe video")
+
+    # --------------------------------------------------
+    # ✅ 3️⃣ PHASE SAMPLING
+    # --------------------------------------------------
+    phases = {
+        "early": (0.05, 0.25),
+        "mid":   (0.35, 0.60),
+        "late":  (0.70, 0.90),
+        "final": (0.90, 0.98)
     }
 
+    frame_urls = []
+    frames_per_phase = math.ceil(MAX_FRAMES / len(phases))
 
-@app.delete("/cleanup/{job_id}")
-def cleanup(job_id: str):
-    path = os.path.join(FILES_ROOT, job_id)
-    if os.path.exists(path):
-        shutil.rmtree(path)
-        return {"status": "deleted"}
-    return {"status": "not_found"}
+    for phase, (start_r, end_r) in phases.items():
+        phase_dir = os.path.join(job_dir, phase)
+        os.makedirs(phase_dir, exist_ok=True)
+
+        # ✅ Only extract if missing
+        if not os.listdir(phase_dir):
+            start_t = duration * start_r
+            end_t = duration * end_r
+            interval = max((end_t - start_t) / frames_per_phase, 1)
+
+            ffmpeg_cmd = [
+                "ffmpeg", "-y",
+                "-ss", str(start_t),
+                "-i", video_path,
+                "-vf", f"fps=1/{interval}",
+                "-frames:v", str(frames_per_phase),
+                f"{phase_dir}/scene_%03d.jpg"
+            ]
+
+            subprocess.run(ffmpeg_cmd, check=True)
+
+        for f in sorted(os.listdir(phase_dir)):
+            url = f"{BASE_URL}/files/{job_id}/{phase}/{f}"
+            frame_urls.append(url)
+
+    frame_urls = frame_urls[:MAX_FRAMES]
+
+    # --------------------------------------------------
+    # ✅ 4️⃣ FINAL RESPONSE (NO ZIP)
+    # --------------------------------------------------
+    return {
+        "job_id": job_id,
+        "duration": duration,
+        "total_frames": len(frame_urls),
+        "frame_urls": frame_urls,
+        "cached": os.path.exists(cached_video_path)
+    }
