@@ -16,8 +16,6 @@ BASE_URL = "https://video-server-return-frames-production.up.railway.app"
 
 MAX_FRAMES = 20
 SCENE_THRESHOLD = 0.35
-BURST_FPS = 8
-BURST_SECONDS = 2.5
 AUDIO_DB_THRESHOLD = -10
 
 # ✅ LOSSLESS IMAGE FORMAT
@@ -30,6 +28,7 @@ app.mount("/files", StaticFiles(directory=FILES_ROOT), name="files")
 
 
 def safe_run(cmd: list):
+    """Run ffmpeg/ffprobe safely and convert errors to HTTP 400."""
     try:
         subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as e:
@@ -121,10 +120,11 @@ def run(video_url: str):
         n_peaks = min(len(peak_indices), MAX_FRAMES // 2)
         if n_peaks > 0:
             for i in range(n_peaks):
+                # spread loud events roughly across duration
                 t = duration * (i + 1) / (n_peaks + 1)
                 audio_event_times.append(t)
 
-    except:
+    except Exception:
         audio_event_times = []
 
     # --------------------------------------------------
@@ -145,81 +145,79 @@ def run(video_url: str):
     visual_event_times = []
     if visual_count > 0:
         for i in range(visual_count):
+            # spread scenes across duration
             t = duration * (i + 1) / (visual_count + 1)
             visual_event_times.append(t)
 
-   # --------------------------------------------------
-# ✅ 4️⃣ INTELLIGENT TIME SCHEDULER (SPACED + WEIGHTED)
-# --------------------------------------------------
+    # --------------------------------------------------
+    # ✅ 4️⃣ INTELLIGENT TIME SCHEDULER (SPACED + WEIGHTED)
+    # --------------------------------------------------
+    # A) BASELINE EVEN COVERAGE (50%)
+    baseline_slots = MAX_FRAMES // 2
+    baseline_times = [
+        duration * (i + 1) / (baseline_slots + 1)
+        for i in range(baseline_slots)
+    ]
 
-# ---- A) BASELINE EVEN COVERAGE (50%)
-baseline_slots = MAX_FRAMES // 2
-baseline_times = [
-    duration * (i + 1) / (baseline_slots + 1)
-    for i in range(baseline_slots)
-]
+    # B) EVENT-FOCUSED DENSITY (50%)
+    event_slots = MAX_FRAMES - baseline_slots
 
-# ---- B) EVENT-FOCUSED DENSITY (50%)
-event_slots = MAX_FRAMES - baseline_slots
+    # Prioritise both visual & audio events
+    priority_events = sorted(set(visual_event_times + audio_event_times))
 
-# Prioritise both visual & audio events
-priority_events = sorted(set(visual_event_times + audio_event_times))
+    if priority_events and event_slots > 0:
+        step = max(1, len(priority_events) // event_slots)
+        dense_times = priority_events[::step][:event_slots]
+    else:
+        dense_times = []
 
-# If too many events, spread them proportionally
-if priority_events:
-    step = max(1, len(priority_events) // event_slots)
-    dense_times = priority_events[::step][:event_slots]
-else:
-    dense_times = []
+    # C) MICRO-BURSTS AROUND EACH EVENT (±0.6s)
+    expanded_dense_times = []
+    for t in dense_times:
+        for offset in (-0.6, 0.0, 0.6):
+            expanded_dense_times.append(t + offset)
 
-# ---- C) MICRO-BURSTS AROUND EACH EVENT (±0.6s)
-expanded_dense_times = []
-for t in dense_times:
-    for offset in (-0.6, 0.0, 0.6):
-        expanded_dense_times.append(t + offset)
+    # D) MERGE + CLAMP + DEDUPE
+    all_times = baseline_times + expanded_dense_times
 
-# ---- D) MERGE + CLAMP + DEDUPE
-all_times = baseline_times + expanded_dense_times
+    safe_times = []
+    epsilon = 0.1
+    for t in sorted(all_times):
+        if 0 <= t <= duration - epsilon:
+            safe_times.append(round(t, 2))
 
-safe_times = []
-epsilon = 0.1
-for t in sorted(all_times):
-    if 0 <= t <= duration - epsilon:
-        safe_times.append(round(t, 2))
+    safe_times = sorted(set(safe_times))
 
-safe_times = sorted(set(safe_times))
+    # If somehow empty, just use middle frame
+    if not safe_times:
+        safe_times = [round(duration / 2.0, 2)]
 
-# ---- E) FINAL 20 MAX GUARANTEE
-safe_times = safe_times[:MAX_FRAMES]
+    # E) FINAL 20 MAX GUARANTEE
+    safe_times = safe_times[:MAX_FRAMES]
 
+    # --------------------------------------------------
+    # ✅ 5️⃣ FRAME EXTRACTION AT SCHEDULED TIMES (PNG)
+    # --------------------------------------------------
+    if not os.listdir(burst_dir):
+        for i, t in enumerate(safe_times):
+            burst_path = os.path.join(
+                burst_dir, f"frame_{i:03d}.{IMAGE_EXT}"
+            )
 
-   # --------------------------------------------------
-# ✅ 5️⃣ FRAME EXTRACTION AT SCHEDULED TIMES (PNG)
-# --------------------------------------------------
-if not os.listdir(burst_dir):
-
-    for i, t in enumerate(safe_times):
-
-        burst_path = os.path.join(
-            burst_dir, f"frame_{i:03d}.{IMAGE_EXT}"
-        )
-
-        # Single-frame precise extraction (no blur, no duplicates)
-        safe_run([
-            "ffmpeg", "-y",
-            "-ss", str(t),
-            "-i", video_path,
-            "-frames:v", "1",
-            burst_path
-        ])
-
+            # Single-frame precise extraction
+            safe_run([
+                "ffmpeg", "-y",
+                "-ss", str(t),
+                "-i", video_path,
+                "-frames:v", "1",
+                burst_path
+            ])
 
     # --------------------------------------------------
     # ✅ 6️⃣ SAFETY FALLBACK (LOSSLESS PNG)
     # --------------------------------------------------
     if not os.listdir(burst_dir):
         interval = max(duration / MAX_FRAMES, 2.0)
-
         safe_run([
             "ffmpeg", "-y",
             "-i", video_path,
@@ -227,7 +225,6 @@ if not os.listdir(burst_dir):
             "-frames:v", str(MAX_FRAMES),
             f"{fallback_dir}/fallback_%03d.{IMAGE_EXT}"
         ])
-
         active_dir = fallback_dir
     else:
         active_dir = burst_dir
