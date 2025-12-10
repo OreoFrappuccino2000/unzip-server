@@ -20,9 +20,8 @@ BURST_FPS = 8
 BURST_SECONDS = 2.5
 AUDIO_DB_THRESHOLD = -10
 
-# ✅ IMAGE QUALITY SETTINGS (CRITICAL)
-JPG_QUALITY = "2"          # 2 = visually lossless, 31 = worst
-JPG_PIXEL_FORMAT = "yuvj420p"  # full-range JPEG (prevents dull colors)
+# ✅ LOSSLESS IMAGE FORMAT
+IMAGE_EXT = "png"   # TRUE LOSSLESS OUTPUT
 
 os.makedirs(FILES_ROOT, exist_ok=True)
 os.makedirs(CACHE_ROOT, exist_ok=True)
@@ -31,7 +30,6 @@ app.mount("/files", StaticFiles(directory=FILES_ROOT), name="files")
 
 
 def safe_run(cmd: list):
-    """Run ffmpeg/ffprobe safely."""
     try:
         subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as e:
@@ -130,7 +128,7 @@ def run(video_url: str):
         audio_event_times = []
 
     # --------------------------------------------------
-    # ✅ 3️⃣ VISUAL SCENE DETECTION (HIGH QUALITY JPG)
+    # ✅ 3️⃣ VISUAL SCENE DETECTION (PNG)
     # --------------------------------------------------
     if not os.listdir(scene_dir):
         safe_run([
@@ -138,9 +136,7 @@ def run(video_url: str):
             "-i", video_path,
             "-vf", f"select='gt(scene,{SCENE_THRESHOLD})'",
             "-vsync", "vfr",
-            "-q:v", JPG_QUALITY,
-            "-pix_fmt", JPG_PIXEL_FORMAT,
-            f"{scene_dir}/scene_%04d.jpg"
+            f"{scene_dir}/scene_%04d.{IMAGE_EXT}"
         ])
 
     visual_files = sorted(os.listdir(scene_dir))
@@ -172,12 +168,14 @@ def run(video_url: str):
     safe_times = safe_times[:MAX_FRAMES]
 
     # --------------------------------------------------
-    # ✅ 5️⃣ HIGH-FPS BURST EXTRACTION (BEST JPG QUALITY)
+    # ✅ 5️⃣ HIGH-FPS BURST EXTRACTION (LOSSLESS PNG)
     # --------------------------------------------------
     if not os.listdir(burst_dir):
         for i, t in enumerate(safe_times):
             start = max(0, t - BURST_SECONDS / 2.0)
-            burst_pattern = os.path.join(burst_dir, f"burst_{i:03d}_%03d.jpg")
+            burst_pattern = os.path.join(
+                burst_dir, f"burst_{i:03d}_%03d.{IMAGE_EXT}"
+            )
 
             safe_run([
                 "ffmpeg", "-y",
@@ -185,13 +183,11 @@ def run(video_url: str):
                 "-i", video_path,
                 "-t", str(BURST_SECONDS),
                 "-vf", f"fps={BURST_FPS}",
-                "-q:v", JPG_QUALITY,
-                "-pix_fmt", JPG_PIXEL_FORMAT,
                 burst_pattern
             ])
 
     # --------------------------------------------------
-    # ✅ 6️⃣ SAFETY FALLBACK (BEST JPG QUALITY)
+    # ✅ 6️⃣ SAFETY FALLBACK (LOSSLESS PNG)
     # --------------------------------------------------
     if not os.listdir(burst_dir):
         interval = max(duration / MAX_FRAMES, 2.0)
@@ -201,9 +197,7 @@ def run(video_url: str):
             "-i", video_path,
             "-vf", f"fps=1/{interval}",
             "-frames:v", str(MAX_FRAMES),
-            "-q:v", JPG_QUALITY,
-            "-pix_fmt", JPG_PIXEL_FORMAT,
-            f"{fallback_dir}/fallback_%03d.jpg"
+            f"{fallback_dir}/fallback_%03d.{IMAGE_EXT}"
         ])
 
         active_dir = fallback_dir
