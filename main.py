@@ -1,7 +1,6 @@
 import hashlib
 import subprocess
 import os
-import math
 import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -15,24 +14,28 @@ FILES_ROOT = "/app/files"
 CACHE_ROOT = "/tmp/cache"
 BASE_URL = "https://video-server-return-frames-production.up.railway.app"
 
-MAX_FRAMES = 20
-SCENE_THRESHOLD = 0.35
-BURST_FPS = 8
-BURST_SECONDS = 2.5
-AUDIO_DB_THRESHOLD = -10
+MAX_FRAMES = 20               # total frames to return
+SCENE_THRESHOLD = 0.35        # sensitivity of scene detection
+BURST_FPS = 8                 # frames per second inside each burst
+BURST_SECONDS = 2.5           # duration of each burst window
+AUDIO_DB_THRESHOLD = -10      # loudness threshold for "hype" audio
 
 os.makedirs(FILES_ROOT, exist_ok=True)
 os.makedirs(CACHE_ROOT, exist_ok=True)
 
 app.mount("/files", StaticFiles(directory=FILES_ROOT), name="files")
 
-# --------------------------------------------------
-# ✅ API
-# --------------------------------------------------
+
+def safe_run(cmd: list):
+    """Run ffmpeg/ffprobe commands and convert errors to HTTP 400."""
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(400, f"ffmpeg failed: {e}")
+
 
 @app.post("/run")
 def run(video_url: str):
-
     video_url = video_url.strip()
 
     # --------------------------------------------------
@@ -82,11 +85,14 @@ def run(video_url: str):
     except:
         raise HTTPException(400, "Failed to probe duration")
 
+    if duration <= 0:
+        raise HTTPException(400, "Video has invalid duration")
+
     # --------------------------------------------------
     # ✅ 2.5️⃣ OPTIONAL AUDIO PEAK DETECTION (SAFE)
     # --------------------------------------------------
+    # We only care about how MANY loud peaks there are, not exact timestamps.
     audio_event_times = []
-
     try:
         audio_cmd = [
             "ffmpeg", "-i", video_path,
@@ -101,82 +107,102 @@ def run(video_url: str):
             text=True
         )
 
-        current_time = 0
-
-        for line in proc.stderr:
+        peak_indices = []
+        for idx, line in enumerate(proc.stderr):
             if "Peak level dB" in line:
                 try:
                     db = float(line.strip().split(":")[-1])
                     if db > AUDIO_DB_THRESHOLD:
-                        audio_event_times.append(current_time)
+                        peak_indices.append(idx)
                 except:
                     pass
-            current_time += 0.5   # approx rolling window
 
-    except:
-        audio_event_times = []   # ✅ No audio present → safe fallback
+        # Map loud peaks evenly into the duration
+        n_peaks = min(len(peak_indices), MAX_FRAMES // 2)
+        if n_peaks > 0:
+            for i in range(n_peaks):
+                t = duration * (i + 1) / (n_peaks + 1)
+                audio_event_times.append(t)
 
+    except Exception:
+        # No audio stream or analysis failed → just ignore audio hints
+        audio_event_times = []
 
     # --------------------------------------------------
-    # ✅ 3️⃣ VISUAL SCENE DETECTION (PRIMARY)
+    # ✅ 3️⃣ VISUAL SCENE DETECTION (PRIMARY SIGNAL)
     # --------------------------------------------------
     if not os.listdir(scene_dir):
-
-        subprocess.run([
+        safe_run([
             "ffmpeg", "-y",
             "-i", video_path,
             "-vf", f"select='gt(scene,{SCENE_THRESHOLD})',showinfo",
             "-vsync", "vfr",
             f"{scene_dir}/scene_%04d.jpg"
-        ], check=True)
+        ])
+
+    visual_files = sorted(os.listdir(scene_dir))
+    visual_count = len(visual_files)
+
+    # Spread visual event times across duration based on count
+    visual_event_times = []
+    if visual_count > 0:
+        for i in range(visual_count):
+            # From early to late game roughly
+            t = duration * (i + 1) / (visual_count + 1)
+            visual_event_times.append(t)
 
     # --------------------------------------------------
-    # ✅ 4️⃣ MERGE VISUAL + AUDIO EVENT TIMES
+    # ✅ 4️⃣ MERGE & CLAMP EVENT TIMES
     # --------------------------------------------------
-    visual_count = len(os.listdir(scene_dir))
-    visual_times = [
-        duration * (i / max(visual_count, 1))
-        for i in range(visual_count)
-    ]
+    all_event_times = sorted(set(visual_event_times + audio_event_times))
 
-    all_event_times = sorted(set(
-        visual_times + audio_event_times
-    ))
+    # Clamp all times into [0, duration - ε]
+    safe_times = []
+    epsilon = 0.1
+    for t in all_event_times:
+        if t < 0:
+            continue
+        if t > duration - epsilon:
+            t = max(0, duration - epsilon)
+        safe_times.append(t)
+
+    # If we somehow still have no event times (very static, no audio),
+    # just center one event in the middle.
+    if not safe_times:
+        safe_times = [duration / 2.0]
+
+    # Limit number of bursts by MAX_FRAMES
+    safe_times = safe_times[:MAX_FRAMES]
 
     # --------------------------------------------------
-    # ✅ 5️⃣ HIGH-FPS BURST EXTRACTION
+    # ✅ 5️⃣ HIGH-FPS BURST EXTRACTION AROUND EVENTS
     # --------------------------------------------------
     if not os.listdir(burst_dir):
+        for i, t in enumerate(safe_times):
+            start = max(0, t - BURST_SECONDS / 2.0)
+            burst_pattern = os.path.join(burst_dir, f"burst_{i:03d}_%03d.jpg")
 
-        for i, t in enumerate(all_event_times[:MAX_FRAMES]):
-
-            start = max(0, t - 1.2)
-            burst_path = os.path.join(burst_dir, f"burst_{i:03d}_%03d.jpg")
-
-            subprocess.run([
+            safe_run([
                 "ffmpeg", "-y",
                 "-ss", str(start),
                 "-i", video_path,
                 "-t", str(BURST_SECONDS),
                 "-vf", f"fps={BURST_FPS}",
-                burst_path
-            ], check=True)
+                burst_pattern
+            ])
 
     # --------------------------------------------------
     # ✅ 6️⃣ SAFETY FALLBACK (UNIFORM SAMPLING)
     # --------------------------------------------------
     if not os.listdir(burst_dir):
-
-        interval = max(duration / MAX_FRAMES, 2)
-
-        subprocess.run([
+        interval = max(duration / MAX_FRAMES, 2.0)
+        safe_run([
             "ffmpeg", "-y",
             "-i", video_path,
             "-vf", f"fps=1/{interval}",
             "-frames:v", str(MAX_FRAMES),
             f"{fallback_dir}/fallback_%03d.jpg"
-        ], check=True)
-
+        ])
         active_dir = fallback_dir
     else:
         active_dir = burst_dir
@@ -185,7 +211,6 @@ def run(video_url: str):
     # ✅ 7️⃣ FINAL URL RESPONSE
     # --------------------------------------------------
     frame_urls = []
-
     for f in sorted(os.listdir(active_dir)):
         frame_urls.append(
             f"{BASE_URL}/files/{job_id}/{os.path.basename(active_dir)}/{f}"
