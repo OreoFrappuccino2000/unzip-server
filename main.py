@@ -24,7 +24,6 @@ BASE_URL = "https://video-server-return-frames-production.up.railway.app"
 
 @app.post("/run")
 def run(video_url: str):
-@@ -34,9 +37,11 @@ def run(video_url: str):
     # --------------------------------------------------
     # ✅ 1️⃣ VIDEO DOWNLOAD (CACHED)
     # --------------------------------------------------
@@ -38,7 +37,7 @@ def run(video_url: str):
                 r.raise_for_status()
                 with open(cached_video_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=1024 * 1024):
-@@ -46,9 +51,6 @@ def run(video_url: str):
+def run(video_url: str):
             raise HTTPException(400, f"Failed to download video: {e}")
 
     video_path = cached_video_path
@@ -48,7 +47,7 @@ def run(video_url: str):
 
     # --------------------------------------------------
     # ✅ 2️⃣ PROBE DURATION
-@@ -64,9 +66,9 @@ def run(video_url: str):
+def run(video_url: str):
         raise HTTPException(400, "Failed to probe video")
 
     # --------------------------------------------------
@@ -60,7 +59,7 @@ def run(video_url: str):
         "early": (0.05, 0.25),
         "mid":   (0.35, 0.60),
         "late":  (0.70, 0.90),
-@@ -75,13 +77,15 @@ def run(video_url: str):
+def run(video_url: str):
 
     frame_urls = []
     frames_per_phase = math.ceil(MAX_FRAMES / len(phases))
@@ -77,7 +76,7 @@ def run(video_url: str):
             start_t = duration * start_r
             end_t = duration * end_r
             interval = max((end_t - start_t) / frames_per_phase, 1)
-@@ -98,18 +102,18 @@ def run(video_url: str):
+def run(video_url: str):
             subprocess.run(ffmpeg_cmd, check=True)
 
         for f in sorted(os.listdir(phase_dir)):
