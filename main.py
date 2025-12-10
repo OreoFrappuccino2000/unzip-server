@@ -150,8 +150,9 @@ def run(video_url: str):
             visual_event_times.append(t)
 
     # --------------------------------------------------
-    # ✅ 4️⃣ INTELLIGENT TIME SCHEDULER (SPACED + WEIGHTED)
+    # ✅ 4️⃣ INTELLIGENT TIME SCHEDULER (SPACED + WEIGHTED, FORCE 20)
     # --------------------------------------------------
+    
     # A) BASELINE EVEN COVERAGE (50%)
     baseline_slots = MAX_FRAMES // 2
     baseline_times = [
@@ -161,10 +162,8 @@ def run(video_url: str):
 
     # B) EVENT-FOCUSED DENSITY (50%)
     event_slots = MAX_FRAMES - baseline_slots
-
-    # Prioritise both visual & audio events
     priority_events = sorted(set(visual_event_times + audio_event_times))
-
+    
     if priority_events and event_slots > 0:
         step = max(1, len(priority_events) // event_slots)
         dense_times = priority_events[::step][:event_slots]
@@ -180,31 +179,51 @@ def run(video_url: str):
     # D) MERGE + CLAMP + DEDUPE
     all_times = baseline_times + expanded_dense_times
 
+    epsilon = 0.05
     safe_times = []
-    epsilon = 0.1
     for t in sorted(all_times):
         if 0 <= t <= duration - epsilon:
             safe_times.append(round(t, 2))
 
     safe_times = sorted(set(safe_times))
 
-    # If somehow empty, just use middle frame
-    if not safe_times:
-        safe_times = [round(duration / 2.0, 2)]
+    # --------------------------------------------------
+    # ✅ E) FORCE EXACTLY 20 FRAMES (FILL IF SHORT)
+    # --------------------------------------------------
+    if len(safe_times) < MAX_FRAMES:
+        needed = MAX_FRAMES - len(safe_times)
+    
+        filler_times = [
+            duration * (i + 1) / (needed + 1)
+            for i in range(needed)
+        ]
 
-    # E) FINAL 20 MAX GUARANTEE
+        safe_times += filler_times
+        safe_times = sorted(set(round(t, 2) for t in safe_times))
+
+    # Final hard cap — ALWAYS EXACTLY 20
     safe_times = safe_times[:MAX_FRAMES]
 
+    # Safety fallback if still somehow broken
+    if len(safe_times) < MAX_FRAMES:
+        safe_times = [
+            round(duration * (i + 1) / (MAX_FRAMES + 1), 2)
+            for i in range(MAX_FRAMES)
+        ]
+
+
     # --------------------------------------------------
-    # ✅ 5️⃣ FRAME EXTRACTION AT SCHEDULED TIMES (PNG)
+    # ✅ 5️⃣ FRAME EXTRACTION AT SCHEDULED TIMES (EXACTLY 20)
     # --------------------------------------------------
     if not os.listdir(burst_dir):
-        for i, t in enumerate(safe_times):
+
+        for i in range(MAX_FRAMES):
+            t = safe_times[i]
+    
             burst_path = os.path.join(
                 burst_dir, f"frame_{i:03d}.{IMAGE_EXT}"
             )
-
-            # Single-frame precise extraction
+    
             safe_run([
                 "ffmpeg", "-y",
                 "-ss", str(t),
@@ -212,6 +231,7 @@ def run(video_url: str):
                 "-frames:v", "1",
                 burst_path
             ])
+
 
     # --------------------------------------------------
     # ✅ 6️⃣ SAFETY FALLBACK (LOSSLESS PNG)
