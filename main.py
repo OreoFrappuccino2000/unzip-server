@@ -16,7 +16,7 @@ os.makedirs(CACHE_ROOT, exist_ok=True)
 
 app.mount("/files", StaticFiles(directory=FILES_ROOT), name="files")
 
-MAX_FRAMES = 19
+MAX_FRAMES = 18
 BASE_URL = "https://video-server-return-frames-production.up.railway.app"
 
 
