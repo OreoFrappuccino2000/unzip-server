@@ -84,7 +84,7 @@ def run(video_url: str):
         "early": (0.05, 0.25),
         "mid":   (0.35, 0.60),
         "late":  (0.70, 0.90),
-        "final": (0.90, 0.98),
+        "final": (0.90, 0.98)
     }
 
     frame_urls = []
